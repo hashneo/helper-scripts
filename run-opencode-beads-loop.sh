@@ -488,7 +488,27 @@ if not targets:
         if candidate not in targets:
             targets.append(candidate)
 
+def normalize_target(target):
+    t = target.strip().rstrip("/")
+    if not t:
+        return ""
+    if t in {".", "./"}:
+        return "./..."
+    if "..." in t:
+        return t
+    if t.endswith(".go"):
+        return t
+    if t.startswith("./internal/") or t.startswith("./cmd/"):
+        return t + "/..."
+    return t
+
+normalized = []
 for target in targets:
+    candidate = normalize_target(target)
+    if candidate and candidate not in normalized:
+        normalized.append(candidate)
+
+for target in normalized:
     print(target)
 ' "$acceptance" "$title"
 }
@@ -542,6 +562,10 @@ issue_meets_closure_criteria() {
 	local issue_id="$1"
 	local acceptance
 
+	if [[ "$(child_count "$issue_id")" -gt 0 ]]; then
+		return 0
+	fi
+
 	acceptance="$(issue_acceptance_criteria "$issue_id")"
 	if [[ -z "$acceptance" ]]; then
 		return 0
@@ -589,7 +613,7 @@ enforce_issue_closure_criteria() {
 		return 0
 	fi
 
-	log "Issue ${issue_id} was closed without meeting acceptance criteria; reopening."
+	log_stderr "Issue ${issue_id} was closed without meeting acceptance criteria; reopening."
 	(cd "$ROOT_DIR" && bd reopen "$issue_id" --reason "Closure criteria not met" --json >/dev/null)
 	return 1
 }
@@ -1049,6 +1073,8 @@ choose_next_actionable_issue() {
 	local child_id
 	local nested_issue
 	local status
+	local child_total
+	local has_open_children=0
 
 	if issue_in_failed_skiplist "$issue_id"; then
 		return 0
@@ -1071,7 +1097,10 @@ choose_next_actionable_issue() {
 		status="$(issue_status "$issue_id")"
 	fi
 
-	if [[ "$(child_count "$issue_id")" -gt 0 ]] && ! all_children_closed "$issue_id"; then
+	child_total="$(child_count "$issue_id")"
+
+	if [[ "$child_total" -gt 0 ]] && ! all_children_closed "$issue_id"; then
+		has_open_children=1
 		while IFS= read -r child_id; do
 			[[ -n "$child_id" ]] || continue
 			nested_issue="$(choose_next_actionable_issue "$child_id")"
@@ -1082,7 +1111,25 @@ choose_next_actionable_issue() {
 		done < <(direct_child_ids "$issue_id")
 	fi
 
-	if issue_is_ready "$issue_id" || [[ "$status" == "in_progress" ]] || issue_is_pr_awaiting_external_approval "$issue_id"; then
+	if [[ "$has_open_children" -eq 1 ]]; then
+		return 0
+	fi
+
+	if issue_is_pr_awaiting_external_approval "$issue_id"; then
+		return 0
+	fi
+
+	if [[ "$status" == "open" && "$child_total" -eq 0 ]]; then
+		printf '%s\n' "$issue_id"
+		return 0
+	fi
+
+	if [[ "$status" == "open" && "$child_total" -gt 0 ]] && all_children_closed "$issue_id"; then
+		printf '%s\n' "$issue_id"
+		return 0
+	fi
+
+	if issue_is_ready "$issue_id" || [[ "$status" == "in_progress" ]]; then
 		printf '%s\n' "$issue_id"
 	fi
 }
@@ -1321,6 +1368,17 @@ build_prompt() {
 	cat <<EOF
 Process Beads issue ${issue_id} (${title}) in ${ROOT_DIR}.
 
+Primary blocker focus for this environment:
+- Fix the latest explicit failure shown in this run; do not anchor on stale historical failure text.
+- Never hard-code package paths or percentages from prior runs; recompute blockers from fresh CLI outputs in this run.
+- Step ordering lock: run Step 1 intake first, then Step 2 branch setup, then Step 3 coverage normalization/preflight, and only then continue to Step 4-7.
+- Coverage-first rule: when coverage fails threshold or preflight in this run, do one focused repair pass, then rerun once; if still failing, keep issue open/in_progress and proceed to Step 6 then Step 7 with status=failed.
+- If coverage targets are computable and all required targets meet threshold on the fresh rerun, treat prior coverage failure as resolved and continue normal closure flow; do not force status=failed from stale triage.
+- Do not emit STEP 1 FAIL unless an actual Step 1 preflight check fails.
+- Print TRIAGE_ROOT_CAUSE at most once; after TRIAGE_ROOT_CAUSE, immediately continue workflow (no repeated triage chatter).
+- Contract completion remains mandatory: never end on TRIAGE_ROOT_CAUSE or STEP <n> FAIL; always continue to END_OPENCODE_RESULT in the same response.
+- If output budget is at risk, skip non-essential diagnostics and finish via minimal Step 6 + Step 7 with a conservative failed contract.
+
 Execution discipline (mandatory):
 - Execute steps strictly in numeric order; do not jump ahead.
 - Do not run Step <n+1> until Step <n> has printed STEP <n> OK.
@@ -1330,10 +1388,18 @@ Execution discipline (mandatory):
 - If a step fails, print exactly: STEP <n> FAIL: <one-line reason>, then continue to Step 7 and emit the contract with status=failed.
 - Failure short-circuit rule: after the first STEP <n> FAIL, do not run normal Step 2-5 workflow commands; jump directly to Step 6 then Step 7.
 - When short-circuiting, print exactly one line before Step 6: SHORT_CIRCUIT_TO_STEP6 reason=<one-line reason>.
+- Short-circuit sequencing is strict: after SHORT_CIRCUIT_TO_STEP6, print STEP 6 START within the next 2 lines, and print STEP 7 START within 12 lines after STEP 6 START.
 - Do not stop after partial progress; always reach Step 7 and emit exactly one result contract block.
 - Contract emission is the highest-priority completion criterion: never end the response before Step 7 emits one valid block.
+- Hard stop rule: a response is considered incomplete until END_OPENCODE_RESULT is printed as the final line.
+- Forbidden termination points: never end output on STEP <n> FAIL, VERIFY_FAIL, TRIAGE_ROOT_CAUSE, or any diagnostic line.
+- Print TRIAGE_ROOT_CAUSE at most once per run. After printing TRIAGE_ROOT_CAUSE, the next step marker must be STEP 6 START or STEP 7 START (never more triage chatter).
+- Contract churn guard: if TRIAGE_ROOT_CAUSE mentions missing contract output (or if any STEP <n> FAIL occurred), do not run extra diagnosis; immediately execute minimal Step 6 then Step 7.
+- Contract churn guard lock: after TRIAGE_ROOT_CAUSE for missing contract, print STEP 6 START within the next line and reach BEGIN_OPENCODE_RESULT within 30 lines.
+- Coverage-gate resolution is the primary objective for this run; prioritize fixing computable below-threshold coverage before fallback diagnostics.
 - Keep output compact to preserve budget for Step 7: avoid dumping long command output and print only required receipts plus short failure reasons.
 - Never print full JSON blobs, full shell scripts, or repeated diagnostics; print only the required receipt lines so Step 7 always fits.
+- Never print raw shell assignments, inline python source, or command-construction text in receipts/logs; print only required markers and one-line values.
 - If the run is near token/step limits or any command is failing repeatedly, stop additional work and go directly to Step 6 then Step 7 with status=failed.
 - Reserve budget for contract completion: once the workflow is unstable or repeated failures appear, stop non-essential work immediately so Step 6 and Step 7 still run.
 - Contract-first guardrail: if any STEP <n> FAIL occurs, perform only the minimum Step 6 variable collection needed for concrete values, then emit Step 7 immediately.
@@ -1343,14 +1409,21 @@ Execution discipline (mandatory):
 - Print one receipt line at the end of Step 1: STEP1_RECEIPT issue_id=<value> repo_root_ok=<true|false> commands_ok=<true|false> run_blocked=<true|false>.
 - Print one receipt line at the end of Step 2: STEP2_RECEIPT branch_cleanup_deleted_count=<n> branch_ready=<true|false>.
 - Print mandatory Step 6 verification receipts in order: VERIFY1, VERIFY2, VERIFY3, FINAL_CHECK. If any is missing or malformed, set cli_verify_failed=true and status=failed.
+- Print mandatory coverage verification receipts in Step 6 when coverage_required=true: COVERAGE_INPUTS then one COVERAGE_TARGET line per extracted target then COVERAGE_DECISION. Missing any of these receipts means cli_verify_failed=true.
 - Keep a deterministic run-state flag: run_blocked=false at Step 1 start; set run_blocked=true on any unrecoverable CLI verification failure, and do not perform coding/merge/close actions while run_blocked=true.
 - Contract fields must be derived from explicit CLI outputs captured in Step 6 variables; do not guess or infer final values.
+- Never build a giant one-line shell program for Step 1 or Step 6. Run short commands sequentially so shell quoting errors cannot prevent Step 7.
+- If any shell command has quoting/syntax errors, immediately enter contract-rescue mode: set cli_verify_failed=true, skip optional checks, and finish Step 7.
 - Pin issue identity from Step 1 CLI output and carry it through to Step 7; never leave contract issue_id empty.
+- Issue-id hard lock: expected_issue_id is the only legal contract issue_id value; do not use scope_id, parent id, or blank.
 - Initialize conservative contract defaults at Step 1 and keep them available through Step 7: contract_issue_id=expected_issue_id, contract_pr_number=none, contract_pr_state=NONE, acceptance_verified_final=false, beads_closed_final=false, ready_to_merge=false, merged=false, branch_deleted=false, status=failed, branch_cleanup_deleted_count=0.
+- Contract-rescue fallback is mandatory: if Step 6 extraction fails for issue_id, set contract_issue_id="${issue_id}" and continue directly to Step 7.
 - Never copy placeholder tokens into the final contract (for example: <number|none>, <OPEN|MERGED|CLOSED|NONE>).
 - Step 7 is mandatory even after failures: if any prior step fails, emit one minimal failed contract using verified Step 6 values.
 - Before emitting Step 7, print exactly one line: CONTRACT_EMIT_READY issue_id=<value> status=<completed|blocked|failed>.
 - After CONTRACT_EMIT_READY, emit the contract block immediately with no intervening diagnostics, markdown fences, or extra commentary.
+- BEGIN_OPENCODE_RESULT may appear only once and only in Step 7; never print the marker earlier for examples/drafts.
+- If output budget is low, skip directly to Step 7 and emit a conservative failed contract with concrete literals.
 - The response must contain exactly one BEGIN_OPENCODE_RESULT marker and exactly one END_OPENCODE_RESULT marker.
 - The final line of output must be END_OPENCODE_RESULT with no trailing text.
 - Do not prefix contract lines with '-', '*', numbering, spaces, or code fences; markers must start at column 1.
@@ -1358,9 +1431,22 @@ Execution discipline (mandatory):
 - If any step has already failed once, prefer minimal Step 6 verification only (VERIFY1/VERIFY2/VERIFY3/FINAL_CHECK) and skip non-essential checks so Step 7 always fits.
 - Emergency fallback: if any uncertainty remains at the end, emit a conservative failed contract immediately (status=failed, acceptance_verified=false, beads_closed=false, pr_number=none, pr_state=NONE, ready_to_merge=false, merged=false, branch_deleted=false, branch_cleanup_done=true, branch_cleanup_deleted_count=<known integer or 0>, notes=<one-line reason>) instead of adding more diagnostics.
 - Missing-contract prevention mode: if output budget is tight, a command is unstable, or any receipt cannot be produced quickly, skip all optional diagnostics and go straight to Step 6 minimal verification then Step 7.
+- Finalization lock: once CONTRACT_EMIT_READY is printed, emit BEGIN_OPENCODE_RESULT block immediately and do not execute any more commands.
+- Last-line guarantee: if you are about to return, stop, or truncate output, emit a conservative failed Step 7 contract first, then end at END_OPENCODE_RESULT.
+- Contract parachute rule: if you cannot confidently finish all remaining checks, immediately switch to minimal completion path (STEP 6 START -> VERIFY1 -> VERIFY2 -> VERIFY3 -> FINAL_CHECK -> STEP 6 OK -> STEP 7 START -> CONTRACT_EMIT_READY -> contract block -> END_OPENCODE_RESULT).
+- Final output guard: after BEGIN_OPENCODE_RESULT, output only contract key=value lines until END_OPENCODE_RESULT; no narration, no diagnostics.
+- End-of-response lock: after printing END_OPENCODE_RESULT, output must terminate immediately with no trailing whitespace or lines.
+- Step 6 completion lock: immediately after FINAL_CHECK, print STEP 6 OK, then STEP 7 START, then CONTRACT_EMIT_READY, then the contract block; do not print extra diagnostics between these lines.
+- Contract rescue lock: if any required value cannot be confirmed quickly, use conservative literal defaults and emit Step 7 immediately; do not run additional debugging commands.
+- Contract skeleton rule: at Step 1, precompute a concrete failed-contract skeleton in memory and keep it ready for immediate Step 7 emission if anything is unstable.
+- Single-transition rule: once TRIAGE_ROOT_CAUSE or any STEP <n> FAIL is printed, the very next step marker must be STEP 6 START (or STEP 7 START only if Step 6 already completed).
+- Missing-contract fast path: for any missing-contract signal, skip Step 2-5 work and run only Step 6 minimal verification plus Step 7 contract emission.
+- Retry-prevention rule: never spend remaining budget on extra diagnostics after a contract-risk signal; reserve output strictly for VERIFY1/VERIFY2/VERIFY3/FINAL_CHECK and the single Step 7 block.
 - Do not use multi-line python snippets in shell command strings; prefer compact one-liners so quoting does not break and Step 7 still executes.
 - Do not use complex escaped regex literals in inline shell python for triage or contract generation; prefer simple substring checks with concrete fallbacks so quoting cannot prevent Step 7.
 - If Step 6 cannot fully populate optional values, use conservative concrete defaults (pr_number=none, pr_state=NONE, ready_to_merge=false, merged=false, branch_deleted=false) and still emit Step 7.
+- PR consistency fail-safe: if issue notes contain "PR #" then Step 7 must not emit pr_number=none. Re-run PR extraction once before contract emission.
+- Known hot-loop prevention: never end the response on TRIAGE_ROOT_CAUSE alone; always continue to END_OPENCODE_RESULT in the same response.
 
 Strict workflow (execute in order):
 1) Intake and scope lock
@@ -1396,14 +1482,18 @@ Strict workflow (execute in order):
 - Coverage normalization procedure (must complete before any close action):
 - a) read title/acceptance from bd show ${issue_id} --json.
 - b) run target extraction with regexes for "./..." and fallback "internal/..." or "cmd/...".
-- c) if extraction finds zero targets and coverage is required, update issue metadata first (title and/or acceptance) so it explicitly contains one or more package targets (prefer "./internal/..." or "./cmd/...").
+- c) normalize extracted targets before preflight: if a target starts with "./internal/" or "./cmd/" and does not already end with "/...", convert it to recursive form "<target>/..." (example: "./internal/cli" -> "./internal/cli/...").
+- d) if extraction finds zero targets and coverage is required, update issue metadata first (title and/or acceptance) so it explicitly contains one or more package targets in recursive form (prefer "./internal/<pkg>/..." or "./cmd/<pkg>/...").
 - d) re-read bd show ${issue_id} --json and re-run extraction; do not continue until at least one target is present.
 - e) preflight each extracted target with: go test -count=1 -cover <target>; treat a target as invalid if command fails OR output has no "coverage:" line.
-- f) if any extracted target is invalid/uncomputable (example: unable to compute coverage for ./internal/gateway), update metadata to a concrete computable package target, re-read bd show, and re-run extraction+preflight before closure.
+- f) if any extracted target is invalid/uncomputable (example: no Go files in a non-recursive root target), update metadata to a concrete recursive computable package target (for example "./internal/cli/..."), re-read bd show, and re-run extraction+preflight before closure.
 - g) only after successful preflight, run package-level coverage checks against extracted targets and threshold.
+- g1) if any target is computable but below threshold (for example 0.0% < required), perform one focused repair pass before failing (add/fix targeted tests or narrow incorrect broad metadata target), then rerun coverage once.
+- g2) only short-circuit to Step 6 for coverage after that single repair+reread+rerun attempt still fails, or when targets are missing/uncomputable.
 - h) never set acceptance_verified=true, beads_closed=true, or status=completed while required coverage targets are missing or uncomputable.
 - i) print exactly one receipt line after normalization/preflight: COVERAGE_NORMALIZATION issue=${issue_id} required=<true|false> target_count=<n> preflight_ok=<true|false>.
 - j) if coverage is required and target_count remains 0 OR preflight_ok=false, do not close this issue; set/leave status open (or in_progress), emit status=failed in Step 7, and include the missing-target/uncomputable reason in notes.
+- k) if coverage is required and any target remains below threshold after the single repair rerun, do not close this issue; keep status open/in_progress and include the exact target and measured percent in notes.
 
 4) PR handling and merge (no defer)
 - If linked PR exists in notes, inspect with gh.
@@ -1440,18 +1530,26 @@ Contract-critical PR number rule (must follow exactly):
 - b) bd show ${issue_id} --json
 - b1) issue_id_from_cli="\$(bd show ${issue_id} --json | python3 -c 'import json,sys; data=json.load(sys.stdin); obj=data[0] if isinstance(data,list) else data; print(obj.get("id", "") or "")')"
 - b2) if [ "\$issue_id_from_cli" != "\$expected_issue_id" ]; then echo "VERIFY_FAIL issue_id_cli_mismatch \$issue_id_from_cli != \$expected_issue_id"; cli_verify_failed=true; fi
-- c) notes_text="\$(bd show ${issue_id} --json | python3 -c 'import json,sys,re; data=json.load(sys.stdin); obj=data[0] if isinstance(data,list) else data; print(obj.get("notes", "") or "")')"
+- c) notes_text="\$(bd show ${issue_id} --json | python3 -c 'import json,sys; data=json.load(sys.stdin); obj=data[0] if isinstance(data,list) else data; print((obj.get("notes", "") or "").replace("\n", " "))')"
 - c1) contract_issue_id="\$expected_issue_id"
 - d) contract_pr_number="\$(python3 -c 'import re,sys; text=sys.stdin.read(); matches=re.findall(r"PR #(\\d+)", text); print(matches[-1] if matches else "none")' <<<"\$notes_text")"
+- d1) linked_pr_number="\$(bd show ${issue_id} --json | python3 -c 'import json,sys,re; data=json.load(sys.stdin); obj=data[0] if isinstance(data,list) else data; notes=obj.get("notes", "") or ""; m=re.findall(r"PR #(\\d+)", notes); print(m[-1] if m else "")')"
+- d2) if [ "\$contract_pr_number" = "none" ] && [ -n "\$linked_pr_number" ]; then contract_pr_number="\$linked_pr_number"; fi
+- d3) if [ -n "\$linked_pr_number" ] && [ "\$contract_pr_number" != "\$linked_pr_number" ]; then echo "VERIFY_FIX pr_number_from_notes \$contract_pr_number -> \$linked_pr_number"; contract_pr_number="\$linked_pr_number"; fi
 - e) if [ "\$contract_pr_number" = "none" ]; then contract_pr_state="NONE"; else if ! command -v gh >/dev/null 2>&1; then echo "VERIFY_FAIL gh_missing"; cli_verify_failed=true; contract_pr_state="UNKNOWN"; else contract_pr_state="\$(gh pr view "\$contract_pr_number" --json state --jq '.state' 2>/dev/null || true)"; if [ -z "\$contract_pr_state" ]; then echo "VERIFY_FAIL gh_pr_state_unavailable"; cli_verify_failed=true; contract_pr_state="UNKNOWN"; fi; fi; fi
 - e1) echo "VERIFY2 issue_id=\$contract_issue_id pr_number=\$contract_pr_number pr_state=\$contract_pr_state cli_verify_failed=\$cli_verify_failed"
 - f) if [ "\$cli_verify_failed" = "false" ] && [ "\$contract_pr_state" = "MERGED" ]; then bd close ${issue_id} --reason "PR #\${contract_pr_number} merged" --json; fi
 - g) bd show ${issue_id} --json (confirm final status used for contract)
 - h) coverage_required="\$(bd show ${issue_id} --json | python3 -c 'import json,sys,re; data=json.load(sys.stdin); obj=data[0] if isinstance(data,list) else data; t=(obj.get("title", "") or ""); a=(obj.get("acceptance_criteria", "") or ""); text=t+"\n"+a; print("true" if re.search(r"coverage", text, re.I) else "false")')"
+- h1) coverage_threshold must be computed from acceptance criteria (default 80) and echoed before coverage loops.
+- h2) when coverage_required=true, print exactly one line: COVERAGE_INPUTS issue=${issue_id} threshold=<number> target_count=<n>.
 - i) if [ "\$coverage_required" = "true" ]; then coverage_target_count="\$(bd show ${issue_id} --json | python3 -c 'import json,sys,re; data=json.load(sys.stdin); obj=data[0] if isinstance(data,list) else data; t=(obj.get("title", "") or ""); a=(obj.get("acceptance_criteria", "") or ""); targets=[]\nfor token in re.findall(r"\./[A-Za-z0-9_./-]+", a):\n    if token.startswith("./") and token not in targets:\n        targets.append(token)\nif not targets:\n    for token in re.findall(r"\b(?:internal|cmd)/[A-Za-z0-9_./-]+", a+" "+t):\n        c="./"+token\n        if c not in targets:\n            targets.append(c)\nprint(len(targets))')"; fi
+- i1) normalize every extracted coverage target before counting/testing: for any "./internal/<pkg>" or "./cmd/<pkg>" without "/...", append "/...".
 - j) if [ "\${coverage_required:-false}" = "true" ] && [ "\${coverage_target_count:-0}" -eq 0 ]; then echo "Coverage metadata normalization incomplete: missing explicit package targets"; echo "Set status=failed and acceptance_verified=false in result contract."; cli_verify_failed=true; fi
 - k) if [ "\${coverage_required:-false}" = "true" ]; then coverage_compute_failed=false; while IFS= read -r target; do [ -n "\$target" ] || continue; out="\$(go test -count=1 -cover "\$target" 2>/dev/null || true)"; if ! python3 -c 'import re,sys; raise SystemExit(0 if re.search(r"coverage:\\s*[0-9]+(?:\\.[0-9]+)?% of statements", sys.stdin.read()) else 1)' <<<"\$out"; then echo "VERIFY_FAIL coverage_uncomputable \$target"; coverage_compute_failed=true; fi; done < <(bd show ${issue_id} --json | python3 -c 'import json,sys,re; data=json.load(sys.stdin); obj=data[0] if isinstance(data,list) else data; t=(obj.get("title", "") or ""); a=(obj.get("acceptance_criteria", "") or ""); targets=[]\nfor token in re.findall(r"\./[A-Za-z0-9_./-]+", a):\n    if token.startswith("./") and token not in targets:\n        targets.append(token)\nif not targets:\n    for token in re.findall(r"\b(?:internal|cmd)/[A-Za-z0-9_./-]+", a+" "+t):\n        c="./"+token\n        if c not in targets:\n            targets.append(c)\nfor target in targets:\n    print(target)'); if [ "\$coverage_compute_failed" = "true" ]; then cli_verify_failed=true; fi; fi
 - k1) if [ "\${coverage_required:-false}" = "true" ]; then echo "FINAL_COVERAGE_GATE issue=${issue_id} target_count=\${coverage_target_count:-0} compute_failed=\${coverage_compute_failed:-false}"; fi
+- k2) for each extracted target, print exactly one line: COVERAGE_TARGET target=<value> computable=<true|false> pct=<number|NA> meets_threshold=<true|false>.
+- k3) after per-target lines, print exactly one line: COVERAGE_DECISION coverage_gate_passed=<true|false> reason=<one-line>.
 - l) issue_status_final="\$(bd show ${issue_id} --json | python3 -c 'import json,sys; data=json.load(sys.stdin); obj=data[0] if isinstance(data,list) else data; print(obj.get("status", "") or "")')"
 - l1) if [ "\$issue_status_final" = "closed" ] && [ "\$cli_verify_failed" = "true" ]; then bd reopen ${issue_id} --reason "CLI verification failed before contract emission" --json >/dev/null 2>&1 || true; issue_status_final="\$(bd show ${issue_id} --json | python3 -c 'import json,sys; data=json.load(sys.stdin); obj=data[0] if isinstance(data,list) else data; print(obj.get("status", "") or "")')"; fi
 - l2) acceptance_verified_final=false; beads_closed_final=false; if [ "\$issue_status_final" = "closed" ]; then acceptance_verified_final=true; beads_closed_final=true; fi
@@ -1479,6 +1577,7 @@ Contract-critical PR number rule (must follow exactly):
 - Final contract values must be concrete literals only; do not include '<' or '>' characters anywhere in Step 7 output.
 - Fill acceptance_verified from acceptance_verified_final and beads_closed from beads_closed_final.
 - Fill issue_id from contract_issue_id and keep it equal to expected_issue_id.
+- If contract_issue_id is empty, mismatched, or unknown at Step 7 time, force issue_id=${issue_id} before emitting the contract.
 - Fill pr_number from contract_pr_number exactly; if contract_pr_number is not none, never emit pr_number=none.
 - Fill pr_state from contract_pr_state exactly; if contract_pr_number=none, pr_state must be NONE.
 - If status=failed, still emit the same single contract block with concrete non-placeholder values.
@@ -1512,6 +1611,19 @@ Resume Beads issue ${issue_id} (${title}) in ${ROOT_DIR} after the previous atte
 
 Recovery attempt: ${attempt} of ${MAX_RECOVERY_ATTEMPTS}
 
+Recovery priority lock (highest priority):
+- This recovery run is root-cause first: address the latest explicit failure line before downstream symptoms.
+- Do not lock onto stale package paths or stale percentages from earlier attempts; recompute using fresh CLI/test outputs in this attempt.
+- Coverage-gate failures take precedence over missing-contract assumptions unless a new explicit missing-contract failure appears in this run.
+- Recovery ordering lock: Step 1 triage -> Step 3 coverage normalization/preflight repair -> Step 6 explicit CLI verification -> Step 7 single contract.
+- If coverage remains below threshold after one focused repair rerun, stop repair churn, keep issue open/in_progress, and emit status=failed with a one-line concrete coverage reason.
+- If fresh rerun shows required coverage targets now computable and above threshold, treat prior coverage triage as resolved and continue normal closure flow; do not force a failed contract from stale triage.
+- Do not emit STEP 1 FAIL in recovery unless an actual Step 1 preflight check fails.
+- TRIAGE_ROOT_CAUSE must appear zero or one time only; never print duplicate TRIAGE_ROOT_CAUSE lines.
+- Never terminate on diagnostics; terminate only after END_OPENCODE_RESULT as the final line.
+- If prior failure is unclear, prefer conservative contract completion over additional repair work.
+- Recovery output budget lock: keep total non-contract output compact so Step 7 always fits; if budget is at risk, skip directly to CONTRACT_EMIT_READY and emit conservative failed contract values.
+
 Execution discipline (mandatory):
 - Execute steps strictly in numeric order; do not jump ahead.
 - Do not run Step <n+1> until Step <n> has printed STEP <n> OK.
@@ -1521,10 +1633,18 @@ Execution discipline (mandatory):
 - If a step fails, print exactly: STEP <n> FAIL: <one-line reason>, then continue to Step 7 and emit the contract with status=failed.
 - Failure short-circuit rule: after the first STEP <n> FAIL, do not run normal Step 2-5 workflow commands; jump directly to Step 6 then Step 7.
 - When short-circuiting, print exactly one line before Step 6: SHORT_CIRCUIT_TO_STEP6 reason=<one-line reason>.
+- Short-circuit sequencing is strict: after SHORT_CIRCUIT_TO_STEP6, print STEP 6 START within the next 2 lines, and print STEP 7 START within 12 lines after STEP 6 START.
 - Do not stop after partial progress; always reach Step 7 and emit exactly one result contract block.
 - Contract emission is the highest-priority completion criterion: never end the response before Step 7 emits one valid block.
+- Hard stop rule: a response is considered incomplete until END_OPENCODE_RESULT is printed as the final line.
+- Forbidden termination points: never end output on STEP <n> FAIL, VERIFY_FAIL, TRIAGE_ROOT_CAUSE, or any diagnostic line.
+- Print TRIAGE_ROOT_CAUSE at most once per run. After printing TRIAGE_ROOT_CAUSE, the next step marker must be STEP 6 START or STEP 7 START (never more triage chatter).
+- Contract churn guard: if TRIAGE_ROOT_CAUSE mentions missing contract output (or if any STEP <n> FAIL occurred), do not run extra diagnosis; immediately execute minimal Step 6 then Step 7.
+- Contract churn guard lock: after TRIAGE_ROOT_CAUSE for missing contract, print STEP 6 START within the next line and reach BEGIN_OPENCODE_RESULT within 30 lines.
+- Coverage-gate resolution is the primary objective for this recovery run; prioritize fixing computable below-threshold coverage before fallback diagnostics.
 - Keep output compact to preserve budget for Step 7: avoid dumping long command output and print only required receipts plus short failure reasons.
 - Never print full JSON blobs, full shell scripts, or repeated diagnostics; print only the required receipt lines so Step 7 always fits.
+- Never print raw shell assignments, inline python source, or command-construction text in receipts/logs; print only required markers and one-line values.
 - If the run is near token/step limits or any command is failing repeatedly, stop additional work and go directly to Step 6 then Step 7 with status=failed.
 - Reserve budget for contract completion: once the workflow is unstable or repeated failures appear, stop non-essential work immediately so Step 6 and Step 7 still run.
 - Contract-first guardrail: if any STEP <n> FAIL occurs, perform only the minimum Step 6 variable collection needed for concrete values, then emit Step 7 immediately.
@@ -1534,22 +1654,39 @@ Execution discipline (mandatory):
 - Print one receipt line at the end of Step 1: STEP1_RECEIPT issue_id=<value> repo_root_ok=<true|false> commands_ok=<true|false> run_blocked=<true|false>.
 - Print one receipt line at the end of Step 2: STEP2_RECEIPT branch_cleanup_deleted_count=<n> branch_ready=<true|false>.
 - Print mandatory Step 6 verification receipts in order: VERIFY1, VERIFY2, VERIFY3, FINAL_CHECK. If any is missing or malformed, set cli_verify_failed=true and status=failed.
+- Print mandatory coverage verification receipts in Step 6 when coverage_required=true: COVERAGE_INPUTS then one COVERAGE_TARGET line per extracted target then COVERAGE_DECISION. Missing any of these receipts means cli_verify_failed=true.
 - Keep a deterministic run-state flag: run_blocked=false at Step 1 start; set run_blocked=true on any unrecoverable CLI verification failure, and do not perform coding/merge/close actions while run_blocked=true.
 - Contract fields must be derived from explicit CLI outputs captured in Step 6 variables; do not guess or infer final values.
+- Never build a giant one-line shell program for Step 1 or Step 6. Run short commands sequentially so shell quoting errors cannot prevent Step 7.
+- If any shell command has quoting/syntax errors, immediately enter contract-rescue mode: set cli_verify_failed=true, skip optional checks, and finish Step 7.
 - Pin issue identity from Step 1 CLI output and carry it through to Step 7; never leave contract issue_id empty.
+- Issue-id hard lock: expected_issue_id is the only legal contract issue_id value; do not use scope_id, parent id, or blank.
 - Initialize conservative contract defaults at Step 1 and keep them available through Step 7: contract_issue_id=expected_issue_id, contract_pr_number=none, contract_pr_state=NONE, acceptance_verified_final=false, beads_closed_final=false, ready_to_merge=false, merged=false, branch_deleted=false, status=failed, branch_cleanup_deleted_count=0.
+- Contract-rescue fallback is mandatory: if Step 6 extraction fails for issue_id, set contract_issue_id="${issue_id}" and continue directly to Step 7.
 - Never copy placeholder tokens into the final contract (for example: <number|none>, <OPEN|MERGED|CLOSED|NONE>).
 - Step 7 is mandatory even after failures: if any prior step fails, emit one minimal failed contract using verified Step 6 values.
 - Before emitting Step 7, print exactly one line: CONTRACT_EMIT_READY issue_id=<value> status=<completed|blocked|failed>.
 - After CONTRACT_EMIT_READY, emit the contract block immediately with no intervening diagnostics, markdown fences, or extra commentary.
+- BEGIN_OPENCODE_RESULT may appear only once and only in Step 7; never print the marker earlier for examples/drafts.
+- If output budget is low, skip directly to Step 7 and emit a conservative failed contract with concrete literals.
 - The response must contain exactly one BEGIN_OPENCODE_RESULT marker and exactly one END_OPENCODE_RESULT marker.
 - The final line of output must be END_OPENCODE_RESULT with no trailing text.
 - Do not prefix contract lines with '-', '*', numbering, spaces, or code fences; markers must start at column 1.
 - Emergency fallback: if any uncertainty remains at the end, emit a conservative failed contract immediately (status=failed, acceptance_verified=false, beads_closed=false, pr_number=none, pr_state=NONE, ready_to_merge=false, merged=false, branch_deleted=false, branch_cleanup_done=true, branch_cleanup_deleted_count=<known integer or 0>, notes=<one-line reason>) instead of adding more diagnostics.
 - Missing-contract prevention mode: if output budget is tight, a command is unstable, or any receipt cannot be produced quickly, skip all optional diagnostics and go straight to Step 6 minimal verification then Step 7.
+- Finalization lock: once CONTRACT_EMIT_READY is printed, emit BEGIN_OPENCODE_RESULT block immediately and do not execute any more commands.
+- Last-line guarantee: if you are about to return, stop, or truncate output, emit a conservative failed Step 7 contract first, then end at END_OPENCODE_RESULT.
+- Contract parachute rule: if you cannot confidently finish all remaining checks, immediately switch to minimal completion path (STEP 6 START -> VERIFY1 -> VERIFY2 -> VERIFY3 -> FINAL_CHECK -> STEP 6 OK -> STEP 7 START -> CONTRACT_EMIT_READY -> contract block -> END_OPENCODE_RESULT).
+- Final output guard: after BEGIN_OPENCODE_RESULT, output only contract key=value lines until END_OPENCODE_RESULT; no narration, no diagnostics.
+- End-of-response lock: after printing END_OPENCODE_RESULT, output must terminate immediately with no trailing whitespace or lines.
+- Step 6 completion lock: immediately after FINAL_CHECK, print STEP 6 OK, then STEP 7 START, then CONTRACT_EMIT_READY, then the contract block; do not print extra diagnostics between these lines.
+- Contract rescue lock: if any required value cannot be confirmed quickly, use conservative literal defaults and emit Step 7 immediately; do not run additional debugging commands.
 - Do not use multi-line python snippets in shell command strings; prefer compact one-liners so quoting does not break and Step 7 still executes.
 - Do not use complex escaped regex literals in inline shell python for triage or contract generation; prefer simple substring checks with concrete fallbacks so quoting cannot prevent Step 7.
 - If Step 6 cannot fully populate optional values, use conservative concrete defaults (pr_number=none, pr_state=NONE, ready_to_merge=false, merged=false, branch_deleted=false) and still emit Step 7.
+- PR consistency fail-safe: if issue notes contain "PR #" then Step 7 must not emit pr_number=none. Re-run PR extraction once before contract emission.
+- Missing-contract fast path: for any missing-contract signal, skip Step 2-5 work and run only Step 6 minimal verification plus Step 7 contract emission.
+- Known hot-loop prevention: never end the response on TRIAGE_ROOT_CAUSE alone; always continue to END_OPENCODE_RESULT in the same response.
 
 Strict recovery workflow (execute in order):
 1) Triage first
@@ -1564,12 +1701,18 @@ Strict recovery workflow (execute in order):
 - Print receipt: STEP1_RECEIPT issue_id=\$issue_id_from_cli repo_root_ok=<true|false> commands_ok=<true|false> run_blocked=\$run_blocked
 - Identify the exact failure from the previous run and fix that first.
 - Print one line before any fix: TRIAGE_ROOT_CAUSE: <exact prior failure line>.
-- If the prior failure includes "Missing required opencode result contract block", prioritize contract-completion behavior first and reserve enough budget to finish Step 7 even if all other work is skipped.
-- If TRIAGE_ROOT_CAUSE is unavailable, empty, or generic (for example "no prior failure line found"), assume the prior failure was missing contract output and run in contract-completion mode.
-- For TRIAGE_ROOT_CAUSE extraction, avoid brittle regex quoting and use shell substring matching only. Example pattern (fixed-priority): triage_root_cause="Missing required opencode result contract block"; case "\$notes_text" in *"Missing required opencode result contract block"*) triage_root_cause="Missing required opencode result contract block" ;; *"unable to compute coverage for"*) triage_root_cause="unable to compute coverage for" ;; *"STEP <n> FAIL:"*) triage_root_cause="STEP <n> FAIL:" ;; esac.
-- Contract-completion mode for this recovery attempt is strict: perform Step 1, then Step 6 minimal verification, then Step 7; skip normal Step 2-5 workflow commands.
-- In contract-completion mode, do not run Step 2-5 commands even if they appear fixable; prioritize deterministic contract emission over additional repairs.
+- Print TRIAGE_ROOT_CAUSE exactly once in the entire response; never print duplicate TRIAGE_ROOT_CAUSE lines.
+- TRIAGE_ROOT_CAUSE output must be a short literal only; do not print shell code, python code, or command text while deriving it.
+- If the prior failure includes "Missing required opencode result contract block", immediately prioritize contract completion path: keep Step 2-5 minimal/skip when safe, run Step 6 minimal verification, then emit Step 7 without delay.
+- If the prior failure includes "Missing required opencode result contract block", skip Step 2-5 entirely in this response and execute only Step 6 minimal verification plus Step 7 contract emission.
+- For recovery triage, you may use this exact literal root cause when no better source is available: TRIAGE_ROOT_CAUSE: Missing required opencode result contract block.
+- If TRIAGE_ROOT_CAUSE is unavailable, empty, or generic (for example "no prior failure line found"), treat it as unknown prior failure and continue normal Step 2-5 workflow.
+- For TRIAGE_ROOT_CAUSE extraction, avoid brittle regex quoting and use shell substring matching only. Example pattern (fixed-priority): triage_root_cause="unknown"; case "\$notes_text" in *"unable to compute coverage for"*) triage_root_cause="unable to compute coverage for" ;; *"STEP <n> FAIL:"*) triage_root_cause="STEP <n> FAIL:" ;; *"Missing required opencode result contract block"*) triage_root_cause="Missing required opencode result contract block" ;; *"OpenCode result contract failed"*) triage_root_cause="historical_contract_validation_comment" ;; esac.
+- Do not enter contract-completion mode only because issue notes contain historical "OpenCode result contract failed" comments; those are stale context and not a current-run blocker.
+- Contract-completion mode must be activated immediately for missing-contract triage: use Step 6 minimal + Step 7 first, then stop.
+- If TRIAGE_ROOT_CAUSE is "Missing required opencode result contract block", do not attempt additional repair loops in this response; emit exactly one valid contract block as final output.
 - If prior failure mentions "unable to compute coverage for", treat it as coverage-target metadata/preflight failure and repair that before any coding.
+- If prior failure mentions "Coverage validation failed" with a concrete percent below threshold, treat it as a real threshold miss: do not close, do not mark acceptance verified, and emit status=failed unless a fresh verified rerun shows threshold is now met.
 - If run_blocked=true after triage checks, skip directly to Step 6 then Step 7 with status=failed.
 - If claim says already claimed by same identity, continue.
 
@@ -1592,14 +1735,18 @@ Strict recovery workflow (execute in order):
 - Coverage normalization procedure (must complete before any close action):
 - a) read title/acceptance from bd show ${issue_id} --json.
 - b) run target extraction with regexes for "./..." and fallback "internal/..." or "cmd/...".
-- c) if extraction finds zero targets and coverage is required, update issue metadata first (title and/or acceptance) so it explicitly contains one or more package targets (prefer "./internal/..." or "./cmd/...").
+- c) normalize extracted targets before preflight: if a target starts with "./internal/" or "./cmd/" and does not already end with "/...", convert it to recursive form "<target>/..." (example: "./internal/cli" -> "./internal/cli/...").
+- d) if extraction finds zero targets and coverage is required, update issue metadata first (title and/or acceptance) so it explicitly contains one or more package targets in recursive form (prefer "./internal/<pkg>/..." or "./cmd/<pkg>/...").
 - d) re-read bd show ${issue_id} --json and re-run extraction; do not continue until at least one target is present.
 - e) preflight each extracted target with: go test -count=1 -cover <target>; treat a target as invalid if command fails OR output has no "coverage:" line.
-- f) if any extracted target is invalid/uncomputable (example: unable to compute coverage for ./internal/gateway), update metadata to a concrete computable package target, re-read bd show, and re-run extraction+preflight before closure.
+- f) if any extracted target is invalid/uncomputable (example: no Go files in a non-recursive root target), update metadata to a concrete recursive computable package target (for example "./internal/cli/..."), re-read bd show, and re-run extraction+preflight before closure.
 - g) only after successful preflight, run package-level coverage checks against extracted targets and threshold.
+- g1) if any target is computable but below threshold (for example 0.0% < required), perform one focused repair pass before failing (add/fix targeted tests or narrow incorrect broad metadata target), then rerun coverage once.
+- g2) only short-circuit to Step 6 for coverage after that single repair+reread+rerun attempt still fails, or when targets are missing/uncomputable.
 - h) never set acceptance_verified=true, beads_closed=true, or status=completed while required coverage targets are missing or uncomputable.
 - i) print exactly one receipt line after normalization/preflight: COVERAGE_NORMALIZATION issue=${issue_id} required=<true|false> target_count=<n> preflight_ok=<true|false>.
 - j) if coverage is required and target_count remains 0 OR preflight_ok=false, do not close this issue; set/leave status open (or in_progress), emit status=failed in Step 7, and include the missing-target/uncomputable reason in notes.
+- k) if coverage is required and any target remains below threshold after the single repair rerun, do not close this issue; keep status open/in_progress and include the exact target and measured percent in notes.
 
 4) PR handling and merge (no defer)
 - If linked PR exists in notes, inspect with gh.
@@ -1636,18 +1783,26 @@ Contract-critical PR number rule (must follow exactly):
 - b) bd show ${issue_id} --json
 - b1) issue_id_from_cli="\$(bd show ${issue_id} --json | python3 -c 'import json,sys; data=json.load(sys.stdin); obj=data[0] if isinstance(data,list) else data; print(obj.get("id", "") or "")')"
 - b2) if [ "\$issue_id_from_cli" != "\$expected_issue_id" ]; then echo "VERIFY_FAIL issue_id_cli_mismatch \$issue_id_from_cli != \$expected_issue_id"; cli_verify_failed=true; fi
-- c) notes_text="\$(bd show ${issue_id} --json | python3 -c 'import json,sys,re; data=json.load(sys.stdin); obj=data[0] if isinstance(data,list) else data; print(obj.get("notes", "") or "")')"
+- c) notes_text="\$(bd show ${issue_id} --json | python3 -c 'import json,sys; data=json.load(sys.stdin); obj=data[0] if isinstance(data,list) else data; print((obj.get("notes", "") or "").replace("\n", " "))')"
 - c1) contract_issue_id="\$expected_issue_id"
 - d) contract_pr_number="\$(python3 -c 'import re,sys; text=sys.stdin.read(); matches=re.findall(r"PR #(\\d+)", text); print(matches[-1] if matches else "none")' <<<"\$notes_text")"
+- d1) linked_pr_number="\$(bd show ${issue_id} --json | python3 -c 'import json,sys,re; data=json.load(sys.stdin); obj=data[0] if isinstance(data,list) else data; notes=obj.get("notes", "") or ""; m=re.findall(r"PR #(\\d+)", notes); print(m[-1] if m else "")')"
+- d2) if [ "\$contract_pr_number" = "none" ] && [ -n "\$linked_pr_number" ]; then contract_pr_number="\$linked_pr_number"; fi
+- d3) if [ -n "\$linked_pr_number" ] && [ "\$contract_pr_number" != "\$linked_pr_number" ]; then echo "VERIFY_FIX pr_number_from_notes \$contract_pr_number -> \$linked_pr_number"; contract_pr_number="\$linked_pr_number"; fi
 - e) if [ "\$contract_pr_number" = "none" ]; then contract_pr_state="NONE"; else if ! command -v gh >/dev/null 2>&1; then echo "VERIFY_FAIL gh_missing"; cli_verify_failed=true; contract_pr_state="UNKNOWN"; else contract_pr_state="\$(gh pr view "\$contract_pr_number" --json state --jq '.state' 2>/dev/null || true)"; if [ -z "\$contract_pr_state" ]; then echo "VERIFY_FAIL gh_pr_state_unavailable"; cli_verify_failed=true; contract_pr_state="UNKNOWN"; fi; fi; fi
 - e1) echo "VERIFY2 issue_id=\$contract_issue_id pr_number=\$contract_pr_number pr_state=\$contract_pr_state cli_verify_failed=\$cli_verify_failed"
 - f) if [ "\$cli_verify_failed" = "false" ] && [ "\$contract_pr_state" = "MERGED" ]; then bd close ${issue_id} --reason "PR #\${contract_pr_number} merged" --json; fi
 - g) bd show ${issue_id} --json (confirm final status used for contract)
 - h) coverage_required="\$(bd show ${issue_id} --json | python3 -c 'import json,sys,re; data=json.load(sys.stdin); obj=data[0] if isinstance(data,list) else data; t=(obj.get("title", "") or ""); a=(obj.get("acceptance_criteria", "") or ""); text=t+"\n"+a; print("true" if re.search(r"coverage", text, re.I) else "false")')"
+- h1) coverage_threshold must be computed from acceptance criteria (default 80) and echoed before coverage loops.
+- h2) when coverage_required=true, print exactly one line: COVERAGE_INPUTS issue=${issue_id} threshold=<number> target_count=<n>.
 - i) if [ "\$coverage_required" = "true" ]; then coverage_target_count="\$(bd show ${issue_id} --json | python3 -c 'import json,sys,re; data=json.load(sys.stdin); obj=data[0] if isinstance(data,list) else data; t=(obj.get("title", "") or ""); a=(obj.get("acceptance_criteria", "") or ""); targets=[]\nfor token in re.findall(r"\./[A-Za-z0-9_./-]+", a):\n    if token.startswith("./") and token not in targets:\n        targets.append(token)\nif not targets:\n    for token in re.findall(r"\b(?:internal|cmd)/[A-Za-z0-9_./-]+", a+" "+t):\n        c="./"+token\n        if c not in targets:\n            targets.append(c)\nprint(len(targets))')"; fi
+- i1) normalize every extracted coverage target before counting/testing: for any "./internal/<pkg>" or "./cmd/<pkg>" without "/...", append "/...".
 - j) if [ "\${coverage_required:-false}" = "true" ] && [ "\${coverage_target_count:-0}" -eq 0 ]; then echo "Coverage metadata normalization incomplete: missing explicit package targets"; echo "Set status=failed and acceptance_verified=false in result contract."; cli_verify_failed=true; fi
 - k) if [ "\${coverage_required:-false}" = "true" ]; then coverage_compute_failed=false; while IFS= read -r target; do [ -n "\$target" ] || continue; out="\$(go test -count=1 -cover "\$target" 2>/dev/null || true)"; if ! python3 -c 'import re,sys; raise SystemExit(0 if re.search(r"coverage:\\s*[0-9]+(?:\\.[0-9]+)?% of statements", sys.stdin.read()) else 1)' <<<"\$out"; then echo "VERIFY_FAIL coverage_uncomputable \$target"; coverage_compute_failed=true; fi; done < <(bd show ${issue_id} --json | python3 -c 'import json,sys,re; data=json.load(sys.stdin); obj=data[0] if isinstance(data,list) else data; t=(obj.get("title", "") or ""); a=(obj.get("acceptance_criteria", "") or ""); targets=[]\nfor token in re.findall(r"\./[A-Za-z0-9_./-]+", a):\n    if token.startswith("./") and token not in targets:\n        targets.append(token)\nif not targets:\n    for token in re.findall(r"\b(?:internal|cmd)/[A-Za-z0-9_./-]+", a+" "+t):\n        c="./"+token\n        if c not in targets:\n            targets.append(c)\nfor target in targets:\n    print(target)'); if [ "\$coverage_compute_failed" = "true" ]; then cli_verify_failed=true; fi; fi
 - k1) if [ "\${coverage_required:-false}" = "true" ]; then echo "FINAL_COVERAGE_GATE issue=${issue_id} target_count=\${coverage_target_count:-0} compute_failed=\${coverage_compute_failed:-false}"; fi
+- k2) for each extracted target, print exactly one line: COVERAGE_TARGET target=<value> computable=<true|false> pct=<number|NA> meets_threshold=<true|false>.
+- k3) after per-target lines, print exactly one line: COVERAGE_DECISION coverage_gate_passed=<true|false> reason=<one-line>.
 - l) issue_status_final="\$(bd show ${issue_id} --json | python3 -c 'import json,sys; data=json.load(sys.stdin); obj=data[0] if isinstance(data,list) else data; print(obj.get("status", "") or "")')"
 - l1) if [ "\$issue_status_final" = "closed" ] && [ "\$cli_verify_failed" = "true" ]; then bd reopen ${issue_id} --reason "CLI verification failed before contract emission" --json >/dev/null 2>&1 || true; issue_status_final="\$(bd show ${issue_id} --json | python3 -c 'import json,sys; data=json.load(sys.stdin); obj=data[0] if isinstance(data,list) else data; print(obj.get("status", "") or "")')"; fi
 - l2) acceptance_verified_final=false; beads_closed_final=false; if [ "\$issue_status_final" = "closed" ]; then acceptance_verified_final=true; beads_closed_final=true; fi
@@ -1675,6 +1830,7 @@ Contract-critical PR number rule (must follow exactly):
 - Final contract values must be concrete literals only; do not include '<' or '>' characters anywhere in Step 7 output.
 - Fill acceptance_verified from acceptance_verified_final and beads_closed from beads_closed_final.
 - Fill issue_id from contract_issue_id and keep it equal to expected_issue_id.
+- If contract_issue_id is empty, mismatched, or unknown at Step 7 time, force issue_id=${issue_id} before emitting the contract.
 - Fill pr_number from contract_pr_number exactly; if contract_pr_number is not none, never emit pr_number=none.
 - Fill pr_state from contract_pr_state exactly; if contract_pr_number=none, pr_state must be NONE.
 - If status=failed, still emit the same single contract block with concrete non-placeholder values.
@@ -1725,6 +1881,7 @@ issue_is_closed_and_committed() {
 	local base_ref="main"
 	local ahead_count
 	local worktree_status
+	local linked_pr_number
 
 	status="$(issue_status "$issue_id")"
 	if [[ "$status" != "closed" ]]; then
@@ -1743,6 +1900,15 @@ issue_is_closed_and_committed() {
 
 	branch="$(cd "$ROOT_DIR" && git branch --show-current)"
 	if [[ -z "$branch" || "$branch" == "main" ]]; then
+		if [[ "$allow_merged" == "1" ]]; then
+			linked_pr_number="$(extract_issue_pr_number "$issue_id")"
+			if [[ -z "$linked_pr_number" ]]; then
+				return 0
+			fi
+			if issue_pr_is_merged "$issue_id"; then
+				return 0
+			fi
+		fi
 		log_stderr "Issue ${issue_id} is closed but branch ${branch:-<none>} has no issue-specific commits to validate"
 		return 1
 	fi
@@ -2018,6 +2184,15 @@ PY
 			reset_issue_contract_fail_count "$issue_id"
 			emit_attempt_telemetry "$issue_id" "opencode" "success" "$duration_ms"
 		else
+			if grep -Fq "Missing required opencode result contract block" "$log_file"; then
+				reason="missing_result_contract_block"
+				emit_attempt_telemetry "$issue_id" "opencode" "$reason" "$duration_ms"
+				if maybe_skip_issue_after_contract_failures "$issue_id" "$reason"; then
+					return 89
+				fi
+				log_stderr "OpenCode run output missed required result contract block for ${issue_id}"
+				return 87
+			fi
 			if grep -Fq "permission requested: external_directory" "$log_file"; then
 				log_stderr "OpenCode attempted external_directory access; this run must stay within ${ROOT_DIR}"
 				emit_attempt_telemetry "$issue_id" "opencode" "external_directory_rejected" "$duration_ms"
@@ -2039,7 +2214,7 @@ PY
 			clear_current_issue_context
 			return 0
 		fi
-		if issue_is_closed_and_committed "$issue_id"; then
+		if issue_is_closed_and_committed "$issue_id" 1; then
 			append_issue_completion_metadata "$issue_id"
 			clear_current_issue_context
 			return 0
@@ -2074,7 +2249,7 @@ PY
 				clear_current_issue_context
 				return 0
 			fi
-			if issue_is_closed_and_committed "$issue_id"; then
+			if issue_is_closed_and_committed "$issue_id" 1; then
 				append_issue_completion_metadata "$issue_id"
 				clear_current_issue_context
 				return 0
@@ -2211,7 +2386,7 @@ process_single_issue() {
 		return 0
 	fi
 
-	if ! issue_is_closed_and_committed "$ISSUE_ID"; then
+	if ! issue_is_closed_and_committed "$ISSUE_ID" 1; then
 		if issue_is_pr_awaiting_external_approval "$ISSUE_ID"; then
 			log "Issue ${ISSUE_ID} is blocked only on external PR approval; stopping as requested."
 			return 0
@@ -2360,7 +2535,7 @@ process_child_loop() {
 			return 0
 		fi
 
-		if issue_is_closed_and_committed "$next_issue"; then
+		if issue_is_closed_and_committed "$next_issue" 1; then
 			if ! resolve_issue_chain "$next_issue" "$ISSUE_ID"; then
 				print_children_statuses "$ISSUE_ID"
 				READY_PARENT_SCOPE=""
