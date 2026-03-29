@@ -18,6 +18,94 @@ RUN_TIMESTAMP=""
 HISTORY_DIR=""
 LOG_PATH=""
 ANALYSIS_LOG_PATH=""
+PATCH_SESSION_FILE=""
+
+latest_opencode_session_meta_for_dir() {
+	local directory="$1"
+	opencode session list --format json --max-count 200 2>/dev/null | python3 - "$directory" <<'PY'
+import json
+import pathlib
+import sys
+
+target = pathlib.Path(sys.argv[1]).resolve()
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    print("\t0")
+    raise SystemExit(0)
+
+best = None
+for item in data:
+    directory = item.get("directory")
+    session_id = item.get("id")
+    updated = item.get("updated")
+    if not directory or not session_id:
+        continue
+    try:
+        entry_dir = pathlib.Path(directory).resolve()
+    except Exception:
+        continue
+    if entry_dir != target:
+        continue
+    if best is None or (isinstance(updated, (int, float)) and updated > best[1]):
+        best = (session_id, int(updated) if isinstance(updated, (int, float)) else 0)
+
+if best is None:
+    print("\t0")
+else:
+    print(f"{best[0]}\t{best[1]}")
+PY
+}
+
+session_exists_for_dir() {
+	local session_id="$1"
+	local directory="$2"
+
+	[[ -n "$session_id" ]] || return 1
+	opencode session list --format json --max-count 500 2>/dev/null | python3 - "$session_id" "$directory" <<'PY'
+import json
+import pathlib
+import sys
+
+session_id = sys.argv[1]
+target = pathlib.Path(sys.argv[2]).resolve()
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+
+for item in data:
+    if item.get("id") != session_id:
+        continue
+    directory = item.get("directory")
+    if not directory:
+        continue
+    try:
+        entry_dir = pathlib.Path(directory).resolve()
+    except Exception:
+        continue
+    if entry_dir == target:
+        raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+}
+
+load_patch_session_id() {
+	if [[ -z "$PATCH_SESSION_FILE" || ! -f "$PATCH_SESSION_FILE" ]]; then
+		return 1
+	fi
+	python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); text=p.read_text().strip() if p.exists() else ""; print(text)' "$PATCH_SESSION_FILE"
+}
+
+save_patch_session_id() {
+	local session_id="$1"
+	[[ -n "$session_id" ]] || return 0
+	mkdir -p "$LOG_ROOT"
+	printf '%s\n' "$session_id" >"$PATCH_SESSION_FILE"
+}
 
 usage() {
 	cat <<EOF
@@ -372,18 +460,58 @@ patch_main_script_from_log() {
 	local patch_status
 	local hash_before
 	local hash_after
+	local patch_session_id=""
+	local session_before_updated=0
+	local latest_session_id=""
+	local latest_session_updated=0
+	local meta
 
 	evidence="$(extract_log_evidence "$log_path")"
 	hint_line="$(primary_blocker_hint "$log_path")"
 	prompt="$(build_patch_prompt "$issue_id" "$evidence" "$hint_line" "$cycle_reason" "$cycle_signature")"
 	patch_log_path="$HISTORY_DIR/opencode-patch-round-${round}.log"
 	hash_before="$(file_sha256 "$MAIN_SCRIPT")"
+	patch_session_id="$(load_patch_session_id 2>/dev/null || true)"
+
+	if [[ -n "$patch_session_id" ]] && session_exists_for_dir "$patch_session_id" "$HELPER_DIR"; then
+		meta="$(latest_opencode_session_meta_for_dir "$HELPER_DIR")"
+		IFS=$'\t' read -r latest_session_id latest_session_updated <<<"$meta"
+		if [[ "$latest_session_id" == "$patch_session_id" ]]; then
+			session_before_updated="$latest_session_updated"
+		fi
+	else
+		patch_session_id=""
+	fi
 
 	set +e
-	(cd "$HELPER_DIR" && opencode run --dir "$HELPER_DIR" "$prompt") 2>&1 | tee "$patch_log_path"
+	if [[ -n "$patch_session_id" ]]; then
+		(cd "$HELPER_DIR" && opencode run --dir "$HELPER_DIR" --session "$patch_session_id" "$prompt") 2>&1 | tee "$patch_log_path"
+	else
+		(cd "$HELPER_DIR" && opencode run --dir "$HELPER_DIR" "$prompt") 2>&1 | tee "$patch_log_path"
+	fi
 	patch_status=${PIPESTATUS[0]}
 	set -e
 	hash_after="$(file_sha256 "$MAIN_SCRIPT")"
+
+	meta="$(latest_opencode_session_meta_for_dir "$HELPER_DIR")"
+	IFS=$'\t' read -r latest_session_id latest_session_updated <<<"$meta"
+	if [[ -z "$patch_session_id" ]]; then
+		if [[ -n "$latest_session_id" ]]; then
+			save_patch_session_id "$latest_session_id"
+			printf 'Round %d patch session: initialized %s\n' "$round" "$latest_session_id"
+		fi
+	else
+		if [[ "$latest_session_id" == "$patch_session_id" ]]; then
+			save_patch_session_id "$patch_session_id"
+			printf 'Round %d patch session: reused %s\n' "$round" "$patch_session_id"
+		elif [[ "$session_before_updated" =~ ^[0-9]+$ && "$latest_session_updated" =~ ^[0-9]+$ && "$latest_session_updated" -gt "$session_before_updated" ]]; then
+			save_patch_session_id "$latest_session_id"
+			printf 'Round %d patch session: switched to latest active session %s\n' "$round" "$latest_session_id"
+		else
+			save_patch_session_id "$patch_session_id"
+			printf 'Round %d patch session: retained %s\n' "$round" "$patch_session_id"
+		fi
+	fi
 
 	printf 'Saved round %d patch log: %s\n' "$round" "$patch_log_path"
 	if [[ "$hash_before" == "$hash_after" ]]; then
@@ -424,9 +552,11 @@ main() {
 
 	RUN_TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 	HISTORY_DIR="$LOG_ROOT/opencode-loop-history/$ISSUE_ID/$RUN_TIMESTAMP"
+	PATCH_SESSION_FILE="$LOG_ROOT/opencode-patch-session.id"
 	mkdir -p "$HISTORY_DIR"
 	printf 'Log root directory: %s\n' "$LOG_ROOT"
 	printf 'Historical logs directory: %s\n' "$HISTORY_DIR"
+	printf 'Patch session file: %s\n' "$PATCH_SESSION_FILE"
 
 	local round
 	for ((round = 1; round <= MAX_PATCH_ROUNDS; round++)); do

@@ -36,6 +36,112 @@ RUN_SNAPSHOT_BRANCH=""
 RUN_SNAPSHOT_ISSUE_STATUS=""
 RUN_SNAPSHOT_PR_STATE=""
 
+latest_opencode_session_meta_for_dir() {
+	local directory="$1"
+	opencode session list --format json --max-count 200 2>/dev/null | python3 - "$directory" <<'PY'
+import json
+import pathlib
+import sys
+
+target = pathlib.Path(sys.argv[1]).resolve()
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    print("\t0")
+    raise SystemExit(0)
+
+best = None
+for item in data:
+    directory = item.get("directory")
+    session_id = item.get("id")
+    updated = item.get("updated")
+    if not directory or not session_id:
+        continue
+    try:
+        entry_dir = pathlib.Path(directory).resolve()
+    except Exception:
+        continue
+    if entry_dir != target:
+        continue
+    if best is None or (isinstance(updated, (int, float)) and updated > best[1]):
+        best = (session_id, int(updated) if isinstance(updated, (int, float)) else 0)
+
+if best is None:
+    print("\t0")
+else:
+    print(f"{best[0]}\t{best[1]}")
+PY
+}
+
+session_exists_for_dir() {
+	local session_id="$1"
+	local directory="$2"
+
+	[[ -n "$session_id" ]] || return 1
+	opencode session list --format json --max-count 500 2>/dev/null | python3 - "$session_id" "$directory" <<'PY'
+import json
+import pathlib
+import sys
+
+session_id = sys.argv[1]
+target = pathlib.Path(sys.argv[2]).resolve()
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+
+for item in data:
+    if item.get("id") != session_id:
+        continue
+    directory = item.get("directory")
+    if not directory:
+        continue
+    try:
+        entry_dir = pathlib.Path(directory).resolve()
+    except Exception:
+        continue
+    if entry_dir == target:
+        raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+}
+
+issue_session_file() {
+	local issue_id="$1"
+	printf '%s/opencode-session-%s.id\n' "$LOG_ROOT" "$issue_id"
+}
+
+load_issue_session_id() {
+	local issue_id="$1"
+	local session_file
+	session_file="$(issue_session_file "$issue_id")"
+	if [[ ! -f "$session_file" ]]; then
+		return 1
+	fi
+	python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); text=p.read_text().strip() if p.exists() else ""; print(text)' "$session_file"
+}
+
+save_issue_session_id() {
+	local issue_id="$1"
+	local session_id="$2"
+	local session_file
+
+	[[ -n "$session_id" ]] || return 0
+	mkdir -p "$LOG_ROOT"
+	session_file="$(issue_session_file "$issue_id")"
+	printf '%s\n' "$session_id" >"$session_file"
+}
+
+clear_issue_session_id() {
+	local issue_id="$1"
+	local session_file
+	session_file="$(issue_session_file "$issue_id")"
+	rm -f "$session_file"
+}
+
 usage() {
 	cat <<'EOF'
 Usage:
@@ -2036,6 +2142,12 @@ run_opencode_for_issue() {
 	local current_status
 	local step_budget="$OPENCODE_STEPS"
 	local -a cmd
+	local session_id=""
+	local session_id_from_cache=""
+	local session_before_updated=0
+	local session_after_updated=0
+	local latest_session_id=""
+	local latest_session_updated=0
 
 	CURRENT_ACTIVE_ISSUE="$issue_id"
 	title="$(issue_title "$issue_id")"
@@ -2067,6 +2179,10 @@ run_opencode_for_issue() {
 		local prompt_text="$1"
 		cmd=(opencode run --dir "$ROOT_DIR")
 
+		if [[ -n "$session_id" ]]; then
+			cmd+=(--session "$session_id")
+		fi
+
 		if [[ -n "$MODEL" ]]; then
 			cmd+=(--model "$MODEL")
 		fi
@@ -2082,6 +2198,49 @@ run_opencode_for_issue() {
 		fi
 
 		cmd+=("$prompt_text")
+	}
+
+	resolve_issue_session_context() {
+		local meta
+		session_id=""
+		session_before_updated=0
+		session_id_from_cache="$(load_issue_session_id "$issue_id" 2>/dev/null || true)"
+		if [[ -n "$session_id_from_cache" ]]; then
+			if session_exists_for_dir "$session_id_from_cache" "$ROOT_DIR"; then
+				session_id="$session_id_from_cache"
+				meta="$(latest_opencode_session_meta_for_dir "$ROOT_DIR")"
+				IFS=$'\t' read -r latest_session_id latest_session_updated <<<"$meta"
+				if [[ "$latest_session_id" == "$session_id" ]]; then
+					session_before_updated="$latest_session_updated"
+				fi
+			else
+				clear_issue_session_id "$issue_id"
+			fi
+		fi
+	}
+
+	persist_issue_session_context() {
+		local meta
+		meta="$(latest_opencode_session_meta_for_dir "$ROOT_DIR")"
+		IFS=$'\t' read -r latest_session_id session_after_updated <<<"$meta"
+		if [[ -z "$latest_session_id" ]]; then
+			return 0
+		fi
+
+		if [[ -z "$session_id" ]]; then
+			session_id="$latest_session_id"
+			session_before_updated=0
+		fi
+
+		if [[ "$latest_session_id" == "$session_id" ]]; then
+			save_issue_session_id "$issue_id" "$session_id"
+			return 0
+		fi
+
+		if [[ "$session_before_updated" =~ ^[0-9]+$ && "$session_after_updated" =~ ^[0-9]+$ && "$session_after_updated" -gt "$session_before_updated" ]]; then
+			session_id="$latest_session_id"
+			save_issue_session_id "$issue_id" "$session_id"
+		fi
 	}
 
 	execute_current_cmd() {
@@ -2206,10 +2365,12 @@ PY
 	}
 
 	log "Running opencode for ${issue_id}: ${title}"
+	resolve_issue_session_context
 
 	prompt="$(build_prompt "$issue_id" "$scope_id" "$title")"
 	build_cmd_for_prompt "$prompt"
 	if execute_current_cmd; then
+		persist_issue_session_context
 		if [[ "$DRY_RUN" -eq 1 ]]; then
 			clear_current_issue_context
 			return 0
@@ -2234,6 +2395,7 @@ PY
 		log "OpenCode exited without closing ${issue_id}; current status is ${current_status}. Treating this as a recoverable failure"
 		exit_code=87
 	else
+		persist_issue_session_context
 		exit_code=$?
 	fi
 
@@ -2245,6 +2407,7 @@ PY
 		prompt="$(build_recovery_prompt "$issue_id" "$scope_id" "$title" "$attempt")"
 		build_cmd_for_prompt "$prompt"
 		if execute_current_cmd; then
+			persist_issue_session_context
 			if [[ "$DRY_RUN" -eq 1 ]]; then
 				clear_current_issue_context
 				return 0
@@ -2269,6 +2432,7 @@ PY
 			log "Recovery attempt ${attempt} exited without closing ${issue_id}; current status is ${current_status}"
 			exit_code=87
 		else
+			persist_issue_session_context
 			exit_code=$?
 		fi
 	done
