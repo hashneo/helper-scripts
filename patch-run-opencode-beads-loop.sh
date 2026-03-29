@@ -4,12 +4,18 @@ set -euo pipefail
 
 HELPER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_NAME="$(basename "$0")"
+INVOCATION_DIR="$(pwd)"
 GATEWAY_ROOT="${GATEWAY_ROOT:-$HOME/Development/github/hashicorp/a2a/gateway}"
 ROOT_DIR="$GATEWAY_ROOT"
 MAIN_SCRIPT="${MAIN_SCRIPT:-$HELPER_DIR/run-opencode-beads-loop.sh}"
+LOG_ROOT_RAW="${OPENCODE_LOG_ROOT:-$INVOCATION_DIR/.tmp}"
+LOG_ROOT="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$LOG_ROOT_RAW")"
 ISSUE_ID="${1:-}"
 MAX_RECOVERY_ATTEMPTS="${MAX_RECOVERY_ATTEMPTS:-3}"
 RECOVERY_STEP_INCREMENT="${RECOVERY_STEP_INCREMENT:-15}"
+MAX_PATCH_ROUNDS="${MAX_PATCH_ROUNDS:-5}"
+RUN_TIMESTAMP=""
+HISTORY_DIR=""
 LOG_PATH=""
 ANALYSIS_LOG_PATH=""
 
@@ -21,10 +27,20 @@ Usage:
 Description:
   Wrapper eval loop that (against GATEWAY_ROOT=${ROOT_DIR}) using
   helper script ${MAIN_SCRIPT}:
-  1) Ensures repository is on main
+  1) Ensures gateway repository is on main before each eval round
   2) Runs run-opencode-beads-loop once with --exit-after-loop and logs output
   3) Invokes opencode to inspect the log and patch prompts in ${MAIN_SCRIPT}
-  4) Exits when logs indicate no issues and issue tree is complete
+  4) Repeats eval rounds until clean+complete or max rounds reached
+
+Environment:
+  MAX_PATCH_ROUNDS=${MAX_PATCH_ROUNDS}
+  OPENCODE_LOG_ROOT=${LOG_ROOT}
+
+Logs:
+  Latest loop log: 
+    ${LOG_ROOT}/opencode-loop-<issue>.log
+  Historical logs per wrapper run:
+    ${LOG_ROOT}/opencode-loop-history/<issue>/<timestamp>/
 EOF
 }
 
@@ -41,7 +57,10 @@ ensure_on_main() {
 	local branch
 	branch="$(cd "$ROOT_DIR" && git branch --show-current)"
 	if [[ "$branch" != "main" ]]; then
-		fail "This wrapper requires branch main; current branch is ${branch}"
+		printf 'Switching gateway repo from %s to main...\n' "$branch"
+		(cd "$ROOT_DIR" && git checkout main >/dev/null 2>&1) || fail "Unable to switch to main from ${branch}; ensure working tree is clean"
+		branch="$(cd "$ROOT_DIR" && git branch --show-current)"
+		[[ "$branch" == "main" ]] || fail "Expected to be on main but still on ${branch}"
 	fi
 }
 
@@ -80,19 +99,35 @@ log_has_no_errors() {
 
 run_one_loop() {
 	local issue_id="$1"
-	shift
-	LOG_PATH="$ROOT_DIR/.tmp/opencode-loop-${issue_id}.log"
-	ANALYSIS_LOG_PATH="$HELPER_DIR/.tmp/opencode-loop-${issue_id}.log"
-	mkdir -p "$ROOT_DIR/.tmp"
-	mkdir -p "$HELPER_DIR/.tmp"
+	local round="$2"
+	shift 2
+	local cmd_status=0
+	local round_log_path
+	local round_analysis_log_path
 
-	(cd "$ROOT_DIR" && GATEWAY_ROOT="$ROOT_DIR" "$MAIN_SCRIPT" --exit-after-loop --max-recovery-attempts "$MAX_RECOVERY_ATTEMPTS" --recovery-step-increment "$RECOVERY_STEP_INCREMENT" "$issue_id" "$@") 2>&1 | tee "$LOG_PATH"
+	LOG_PATH="$LOG_ROOT/opencode-loop-${issue_id}.log"
+	ANALYSIS_LOG_PATH="$LOG_ROOT/opencode-loop-${issue_id}.analysis.log"
+	round_log_path="$HISTORY_DIR/opencode-loop-${issue_id}-round-${round}.log"
+	round_analysis_log_path="$HISTORY_DIR/opencode-loop-${issue_id}-round-${round}.analysis.log"
+	mkdir -p "$LOG_ROOT"
+
+	set +e
+	(cd "$ROOT_DIR" && GATEWAY_ROOT="$ROOT_DIR" OPENCODE_LOG_ROOT="$LOG_ROOT" "$MAIN_SCRIPT" --exit-after-loop --max-recovery-attempts "$MAX_RECOVERY_ATTEMPTS" --recovery-step-increment "$RECOVERY_STEP_INCREMENT" "$issue_id" "$@") 2>&1 | tee "$LOG_PATH"
+	cmd_status=${PIPESTATUS[0]}
+	set -e
+
 	cp "$LOG_PATH" "$ANALYSIS_LOG_PATH"
+	cp "$LOG_PATH" "$round_log_path"
+	cp "$LOG_PATH" "$round_analysis_log_path"
+
+	printf 'Saved round %d loop log: %s\n' "$round" "$round_log_path"
+	return "$cmd_status"
 }
 
 build_patch_prompt() {
 	local issue_id="$1"
-	local log_path="$2"
+	local evidence="$2"
+	local hint_line="$3"
 	cat <<EOF
 You are tuning run-opencode-beads-loop.sh in the current working directory using log evidence.
 
@@ -100,20 +135,38 @@ Context:
 - Gateway repository: ${ROOT_DIR}
 - Helper script directory: ${HELPER_DIR}
 - Issue: ${issue_id}
-- Log file: ${log_path}
+- Latest evidence (wrapper extracted from loop log):
+${evidence}
+
+Primary blocker hint:
+${hint_line}
 
 Goals (strict order):
 1) First try to fix workflow quality by improving prompt instructions in build_prompt/build_recovery_prompt.
 2) Only if prompt improvements are insufficient, make minimal script logic changes.
 3) Keep changes local to run-opencode-beads-loop.sh unless absolutely necessary.
 
+Important constraints:
+- Do not read files outside current working directory.
+- Do not rely on external paths for log inspection; use the provided evidence above.
+
+Deep-analysis requirements (mandatory):
+- Do NOT skim and do NOT apply speculative patches.
+- Identify at least 3 distinct failure modes from the provided evidence.
+- For each failure mode, include:
+  - exact evidence snippet (quoted text)
+  - root cause hypothesis
+  - why this causes churn/retries
+  - preferred fix type (prompt change first, script change only if needed)
+- If evidence is insufficient for a safe patch, state that explicitly and make no code changes.
+
 Required actions:
-- Read ${log_path} and identify top failure modes from the latest run.
+- Identify top failure modes from the provided evidence.
 - Patch run-opencode-beads-loop.sh accordingly (prompt-first).
 - Avoid broad refactors; apply smallest effective patch.
 - Run bash -n run-opencode-beads-loop.sh after patching.
 - In your final response, include:
-  - what failed (with concrete log evidence)
+  - failure analysis (>=3 modes, each with concrete evidence)
   - what was changed (prompt vs script)
   - why this should improve next run.
 
@@ -121,13 +174,100 @@ Stop after applying and validating the patch. Do not run the main loop script in
 EOF
 }
 
+extract_log_evidence() {
+	local log_path="$1"
+	python3 - "$log_path" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.exists():
+    print("- log file missing")
+    raise SystemExit(0)
+
+text = path.read_text(errors="replace")
+lines = text.splitlines()
+
+patterns = [
+    ("invalid_contract", r"Invalid result contract:.*"),
+    ("missing_contract", r"Missing required opencode result contract block.*"),
+    ("contract_failure_counter", r"OpenCode result contract failed .*"),
+    ("external_directory", r"permission requested: external_directory.*"),
+    ("coverage_target_missing", r"Coverage validation failed .*no coverage package targets.*"),
+    ("descendant_reopen", r"Reopening descendant issue .*"),
+    ("no_actionable", r"ERROR: No actionable descendants.*"),
+]
+
+print("- total_log_lines=" + str(len(lines)))
+
+for name, patt in patterns:
+    m = re.findall(patt, text)
+    print(f"- {name}_count={len(m)}")
+
+interesting = []
+for line in lines:
+    if re.search(r"Invalid result contract|Missing required opencode result contract block|permission requested: external_directory|Coverage validation failed|Reopening descendant issue|ERROR:", line):
+        interesting.append(line)
+
+for sample in interesting[:12]:
+    print("- sample: " + sample)
+PY
+}
+
+primary_blocker_hint() {
+	local log_path="$1"
+	python3 - "$log_path" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.exists():
+    print("No log available; focus on improving result contract reliability first.")
+    raise SystemExit(0)
+
+text = path.read_text(errors="replace")
+
+checks = [
+    (r"Invalid result contract: linked PR mismatch", "Linked PR mismatch in contract is causing retries; prioritize prompt updates for canonical PR reporting and note normalization."),
+    (r"Missing required opencode result contract block", "Missing contract block is causing retries; prioritize strict end-of-response contract generation."),
+    (r"permission requested: external_directory", "External directory access is being rejected; reinforce local-only operations and avoid out-of-repo reads."),
+    (r"Coverage validation failed .*no coverage package targets", "Coverage target extraction is reopening descendants; prompt should require metadata normalization before closure."),
+]
+
+for patt, msg in checks:
+    if re.search(patt, text):
+        print(msg)
+        raise SystemExit(0)
+
+print("General churn detected; tighten prompt ordering and explicit CLI verification steps.")
+PY
+}
+
 patch_main_script_from_log() {
 	local issue_id="$1"
 	local log_path="$2"
+	local round="$3"
 	local prompt
+	local evidence
+	local hint_line
+	local patch_log_path
+	local patch_status
 
-	prompt="$(build_patch_prompt "$issue_id" "$log_path")"
-	(cd "$HELPER_DIR" && opencode run --dir "$HELPER_DIR" "$prompt")
+	evidence="$(extract_log_evidence "$log_path")"
+	hint_line="$(primary_blocker_hint "$log_path")"
+	prompt="$(build_patch_prompt "$issue_id" "$evidence" "$hint_line")"
+	patch_log_path="$HISTORY_DIR/opencode-patch-round-${round}.log"
+
+	set +e
+	(cd "$HELPER_DIR" && opencode run --dir "$HELPER_DIR" "$prompt") 2>&1 | tee "$patch_log_path"
+	patch_status=${PIPESTATUS[0]}
+	set -e
+
+	printf 'Saved round %d patch log: %s\n' "$round" "$patch_log_path"
+
+	return "$patch_status"
 }
 
 main() {
@@ -154,17 +294,41 @@ main() {
 	if [[ "${1:-}" == "--" ]]; then
 		shift
 	fi
+	local -a passthrough_args=("$@")
 
-	run_one_loop "$ISSUE_ID" "$@" || true
+	[[ "$MAX_PATCH_ROUNDS" =~ ^[0-9]+$ ]] || fail "MAX_PATCH_ROUNDS must be an integer"
+	((MAX_PATCH_ROUNDS > 0)) || fail "MAX_PATCH_ROUNDS must be greater than 0"
 
-	if log_has_no_errors "$LOG_PATH" && issue_tree_complete "$ISSUE_ID"; then
-		printf 'No loop errors detected and issue tree is complete; exiting.\n'
-		exit 0
-	fi
+	RUN_TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+	HISTORY_DIR="$LOG_ROOT/opencode-loop-history/$ISSUE_ID/$RUN_TIMESTAMP"
+	mkdir -p "$HISTORY_DIR"
+	printf 'Log root directory: %s\n' "$LOG_ROOT"
+	printf 'Historical logs directory: %s\n' "$HISTORY_DIR"
 
-	patch_main_script_from_log "$ISSUE_ID" "$ANALYSIS_LOG_PATH"
+	local round
+	for ((round = 1; round <= MAX_PATCH_ROUNDS; round++)); do
+		printf '\n=== Eval round %d/%d for %s ===\n' "$round" "$MAX_PATCH_ROUNDS" "$ISSUE_ID"
+		ensure_on_main
 
-	printf 'Patched scripts/run-opencode-beads-loop.sh based on log analysis. Re-run %s %s to iterate.\n' "$SCRIPT_NAME" "$ISSUE_ID"
+		run_one_loop "$ISSUE_ID" "$round" "${passthrough_args[@]}" || true
+
+		if log_has_no_errors "$LOG_PATH" && issue_tree_complete "$ISSUE_ID"; then
+			printf 'No loop errors detected and issue tree is complete; exiting.\n'
+			exit 0
+		fi
+
+		patch_main_script_from_log "$ISSUE_ID" "$ANALYSIS_LOG_PATH" "$round"
+		bash -n "$MAIN_SCRIPT"
+		printf 'Patched %s based on round %d log.\n' "$MAIN_SCRIPT" "$round"
+
+		if ! (cd "$HELPER_DIR" && git diff --quiet -- run-opencode-beads-loop.sh); then
+			printf 'Patch round %d produced script changes. Continuing to next eval round.\n' "$round"
+		else
+			printf 'Patch round %d produced no script changes; continuing anyway.\n' "$round"
+		fi
+	done
+
+	fail "Reached MAX_PATCH_ROUNDS=${MAX_PATCH_ROUNDS} without clean+complete outcome"
 }
 
 main "$@"
