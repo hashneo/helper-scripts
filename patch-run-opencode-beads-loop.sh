@@ -10,7 +10,8 @@ ROOT_DIR="$GATEWAY_ROOT"
 MAIN_SCRIPT="${MAIN_SCRIPT:-$HELPER_DIR/run-opencode-beads-loop.sh}"
 LOG_ROOT_RAW="${OPENCODE_LOG_ROOT:-$INVOCATION_DIR/.tmp}"
 LOG_ROOT="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$LOG_ROOT_RAW")"
-ISSUE_ID="${1:-}"
+ISSUE_ID=""
+CLEAR_LOGS=0
 MAX_RECOVERY_ATTEMPTS="${MAX_RECOVERY_ATTEMPTS:-3}"
 RECOVERY_STEP_INCREMENT="${RECOVERY_STEP_INCREMENT:-15}"
 MAX_PATCH_ROUNDS="${MAX_PATCH_ROUNDS:-5}"
@@ -32,7 +33,7 @@ target = pathlib.Path(sys.argv[1]).resolve()
 try:
     data = json.load(sys.stdin)
 except Exception:
-    print("\t0")
+    print("")
     raise SystemExit(0)
 
 best = None
@@ -52,10 +53,67 @@ for item in data:
         best = (session_id, int(updated) if isinstance(updated, (int, float)) else 0)
 
 if best is None:
-    print("\t0")
+    print("")
 else:
     print(f"{best[0]}\t{best[1]}")
 PY
+}
+
+latest_opencode_session_meta_for_issue_in_dir() {
+	local issue_id="$1"
+	local directory="$2"
+	opencode session list --format json --max-count 500 2>/dev/null | python3 - "$issue_id" "$directory" <<'PY'
+import json
+import pathlib
+import sys
+
+issue_id = (sys.argv[1] or "").strip().lower()
+target = pathlib.Path(sys.argv[2]).resolve()
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    print("")
+    raise SystemExit(0)
+
+best = None
+for item in data:
+    directory = item.get("directory")
+    session_id = item.get("id")
+    updated = item.get("updated")
+    if not directory or not session_id:
+        continue
+    try:
+        entry_dir = pathlib.Path(directory).resolve()
+    except Exception:
+        continue
+    if entry_dir != target:
+        continue
+
+    title = ""
+    for key in ("title", "name", "summary"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            title = value.strip()
+            break
+
+    if issue_id and issue_id not in title.lower():
+        continue
+
+    score = int(updated) if isinstance(updated, (int, float)) else 0
+    if best is None or score > best[1]:
+        best = (session_id, score, title.replace("\t", " ").replace("\n", " "))
+
+if best is None:
+    print("")
+else:
+    print(f"{best[0]}\t{best[1]}\t{best[2]}")
+PY
+}
+
+valid_opencode_session_id() {
+	local session_id="$1"
+	[[ "$session_id" == ses_* ]]
 }
 
 session_exists_for_dir() {
@@ -110,18 +168,23 @@ save_patch_session_id() {
 usage() {
 	cat <<EOF
 Usage:
-  ${SCRIPT_NAME} <issue-id> [-- <extra run-opencode-beads-loop args>]
+  ${SCRIPT_NAME} [--clear-logs] <issue-id> [-- <extra run-opencode-beads-loop args>]
+  ${SCRIPT_NAME} --clear-logs
 
 Description:
   Wrapper eval loop that (against GATEWAY_ROOT=${ROOT_DIR}) using
   helper script ${MAIN_SCRIPT}:
-  1) Runs run-opencode-beads-loop once with --exit-after-loop and logs output
+  1) Runs run-opencode-beads-loop once with --no-pid-locks and logs output
   2) Invokes opencode to inspect the log and patch prompts in ${MAIN_SCRIPT}
   3) Repeats eval rounds until clean+complete or max rounds reached
 
 Environment:
   MAX_PATCH_ROUNDS=${MAX_PATCH_ROUNDS}
   OPENCODE_LOG_ROOT=${LOG_ROOT}
+
+Options:
+  --clear-logs   Delete prior run logs and repository lock files, then continue.
+                 If used without <issue-id>, clear and exit.
 
 Logs:
   Latest loop log: 
@@ -134,6 +197,41 @@ EOF
 fail() {
 	printf 'ERROR: %s\n' "$*" >&2
 	exit 1
+}
+
+repo_lock_scope() {
+	local remote_url
+
+	remote_url="$(cd "$ROOT_DIR" && git remote get-url origin 2>/dev/null || true)"
+	if [[ -z "$remote_url" ]]; then
+		remote_url="$ROOT_DIR"
+	fi
+
+	python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:16])' "$remote_url"
+}
+
+clear_logs_and_locks() {
+	local lock_base="${OPENCODE_BEADS_LOCKS_DIR:-$HOME/.tmp/opencode-beads-locks}"
+	local scope
+	local lock_scope_dir
+
+	printf 'Clearing run logs under %s\n' "$LOG_ROOT"
+	rm -f "$LOG_ROOT"/opencode-loop-*.log
+	rm -f "$LOG_ROOT"/opencode-loop-*.analysis.log
+	rm -f "$LOG_ROOT"/opencode-gateway-*.log
+	rm -f "$LOG_ROOT"/opencode-session-*.id
+	rm -f "$LOG_ROOT"/opencode-contract-fail-*.count
+	rm -f "$LOG_ROOT"/opencode-patch-session*.id
+	rm -rf "$LOG_ROOT"/opencode-loop-history
+
+	scope="$(repo_lock_scope)"
+	lock_scope_dir="$lock_base/$scope"
+	if [[ -d "$lock_scope_dir" ]]; then
+		rm -rf "$lock_scope_dir"
+		printf 'Removed lock directory %s\n' "$lock_scope_dir"
+	else
+		printf 'No lock directory found at %s\n' "$lock_scope_dir"
+	fi
 }
 
 require_command() {
@@ -204,7 +302,7 @@ run_one_loop() {
 	mkdir -p "$LOG_ROOT"
 
 	set +e
-	(cd "$ROOT_DIR" && GATEWAY_ROOT="$ROOT_DIR" OPENCODE_LOG_ROOT="$LOG_ROOT" "$MAIN_SCRIPT" --exit-after-loop --max-recovery-attempts "$MAX_RECOVERY_ATTEMPTS" --recovery-step-increment "$RECOVERY_STEP_INCREMENT" "$issue_id" "$@") 2>&1 | tee "$LOG_PATH"
+	(cd "$ROOT_DIR" && GATEWAY_ROOT="$ROOT_DIR" OPENCODE_LOG_ROOT="$LOG_ROOT" "$MAIN_SCRIPT" --no-pid-locks --max-recovery-attempts "$MAX_RECOVERY_ATTEMPTS" --recovery-step-increment "$RECOVERY_STEP_INCREMENT" "$issue_id" "$@") 2>&1 | tee "$LOG_PATH"
 	cmd_status=${PIPESTATUS[0]}
 	set -e
 
@@ -461,9 +559,11 @@ patch_main_script_from_log() {
 	local hash_before
 	local hash_after
 	local patch_session_id=""
+	local issue_session_id=""
 	local session_before_updated=0
 	local latest_session_id=""
 	local latest_session_updated=0
+	local session_title=""
 	local meta
 
 	evidence="$(extract_log_evidence "$log_path")"
@@ -472,11 +572,30 @@ patch_main_script_from_log() {
 	patch_log_path="$HISTORY_DIR/opencode-patch-round-${round}.log"
 	hash_before="$(file_sha256 "$MAIN_SCRIPT")"
 	patch_session_id="$(load_patch_session_id 2>/dev/null || true)"
+	if [[ -n "$patch_session_id" ]] && ! valid_opencode_session_id "$patch_session_id"; then
+		patch_session_id=""
+	fi
+	meta="$(latest_opencode_session_meta_for_issue_in_dir "$issue_id" "$HELPER_DIR")"
+	IFS=$'\t' read -r issue_session_id _ session_title <<<"$meta"
+	if [[ -n "$issue_session_id" ]] && ! valid_opencode_session_id "$issue_session_id"; then
+		issue_session_id=""
+	fi
+
+	if [[ -n "$issue_session_id" ]]; then
+		if [[ -n "$patch_session_id" && "$patch_session_id" != "$issue_session_id" ]]; then
+			printf 'Round %d patch session: issue-linked session %s overrides cached %s\n' "$round" "$issue_session_id" "$patch_session_id"
+		fi
+		patch_session_id="$issue_session_id"
+		save_patch_session_id "$patch_session_id"
+		if [[ -n "$session_title" ]]; then
+			printf 'Round %d patch session: matched issue %s in session title: %s\n' "$round" "$issue_id" "$session_title"
+		fi
+	fi
 
 	if [[ -n "$patch_session_id" ]] && session_exists_for_dir "$patch_session_id" "$HELPER_DIR"; then
 		meta="$(latest_opencode_session_meta_for_dir "$HELPER_DIR")"
 		IFS=$'\t' read -r latest_session_id latest_session_updated <<<"$meta"
-		if [[ "$latest_session_id" == "$patch_session_id" ]]; then
+		if valid_opencode_session_id "$latest_session_id" && [[ "$latest_session_id" == "$patch_session_id" ]]; then
 			session_before_updated="$latest_session_updated"
 		fi
 	else
@@ -495,6 +614,10 @@ patch_main_script_from_log() {
 
 	meta="$(latest_opencode_session_meta_for_dir "$HELPER_DIR")"
 	IFS=$'\t' read -r latest_session_id latest_session_updated <<<"$meta"
+	if [[ -n "$latest_session_id" ]] && ! valid_opencode_session_id "$latest_session_id"; then
+		latest_session_id=""
+		latest_session_updated=0
+	fi
 	if [[ -z "$patch_session_id" ]]; then
 		if [[ -n "$latest_session_id" ]]; then
 			save_patch_session_id "$latest_session_id"
@@ -524,27 +647,57 @@ patch_main_script_from_log() {
 }
 
 main() {
-	[[ -n "$ISSUE_ID" ]] || {
+	local -a passthrough_args=()
+
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		-h | --help)
+			usage
+			exit 0
+			;;
+		--clear-logs)
+			CLEAR_LOGS=1
+			shift
+			;;
+		--)
+			shift
+			passthrough_args=("$@")
+			break
+			;;
+		-*)
+			fail "Unknown option: $1"
+			;;
+		*)
+			if [[ -z "$ISSUE_ID" ]]; then
+				ISSUE_ID="$1"
+				shift
+			else
+				fail "Unexpected argument: $1"
+			fi
+			;;
+		esac
+	done
+
+	require_command python3
+	require_command git
+
+	if [[ "$CLEAR_LOGS" -eq 1 ]]; then
+		clear_logs_and_locks
+	fi
+
+	if [[ -z "$ISSUE_ID" ]]; then
+		if [[ "$CLEAR_LOGS" -eq 1 ]]; then
+			printf 'Cleanup complete. No issue id provided, exiting.\n'
+			exit 0
+		fi
 		usage
 		exit 1
-	}
-
-	if [[ "$ISSUE_ID" == "-h" || "$ISSUE_ID" == "--help" ]]; then
-		usage
-		exit 0
 	fi
 
 	require_command bd
 	require_command opencode
-	require_command python3
 	[[ -x "$MAIN_SCRIPT" ]] || fail "Main helper script not found or not executable: $MAIN_SCRIPT"
 
-	# Pass through optional extra args after --
-	shift || true
-	if [[ "${1:-}" == "--" ]]; then
-		shift
-	fi
-	local -a passthrough_args=("$@")
 	local last_patch_signature=""
 
 	[[ "$MAX_PATCH_ROUNDS" =~ ^[0-9]+$ ]] || fail "MAX_PATCH_ROUNDS must be an integer"
@@ -552,7 +705,7 @@ main() {
 
 	RUN_TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 	HISTORY_DIR="$LOG_ROOT/opencode-loop-history/$ISSUE_ID/$RUN_TIMESTAMP"
-	PATCH_SESSION_FILE="$LOG_ROOT/opencode-patch-session.id"
+	PATCH_SESSION_FILE="$LOG_ROOT/opencode-patch-session-${ISSUE_ID}.id"
 	mkdir -p "$HISTORY_DIR"
 	printf 'Log root directory: %s\n' "$LOG_ROOT"
 	printf 'Historical logs directory: %s\n' "$HISTORY_DIR"

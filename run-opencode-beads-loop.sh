@@ -3,10 +3,10 @@
 set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
-ROOT_DIR="${GATEWAY_ROOT:-$HOME/Development/github/hashicorp/a2a/gateway}"
+ROOT_DIR="$(pwd)"
 
 MODEL=""
-AGENT=""
+AGENT="build"
 VARIANT=""
 SANDBOX_NAME=""
 OPENCODE_STEPS="${OPENCODE_STEPS:-10}"
@@ -19,6 +19,7 @@ LOOP_LOG_FILE="${OPENCODE_LOOP_LOG_FILE:-.tmp/opencode-loop.log}"
 REQUIRE_SESSION_REUSE="${OPENCODE_REQUIRE_SESSION_REUSE:-1}"
 BOOTSTRAP_PLAN_SESSION="${OPENCODE_BOOTSTRAP_PLAN_SESSION:-1}"
 BOOTSTRAP_PLAN_STEPS="${OPENCODE_BOOTSTRAP_PLAN_STEPS:-6}"
+BOOTSTRAP_PLAN_FILE="${OPENCODE_BOOTSTRAP_PLAN_FILE:-.tmp/plan.md}"
 DRY_RUN=0
 ISSUE_ID=""
 OPENCODE_EXTRA_ARGS=()
@@ -57,6 +58,7 @@ Environment:
   OPENCODE_SESSION_ID                  Initial OpenCode session id to reuse
   OPENCODE_BOOTSTRAP_PLAN_SESSION      Create session with plan run when missing (0|1)
   OPENCODE_BOOTSTRAP_PLAN_STEPS        Step budget for bootstrap plan run (default: 6)
+  OPENCODE_BOOTSTRAP_PLAN_FILE         Path for the plan markdown file (default: .tmp/plan.md)
 EOF
 }
 
@@ -305,11 +307,8 @@ bootstrap_root_session_with_plan() {
 	local bootstrap_prompt
 	local bootstrap_steps
 	local config_json
-	local tmp_log
 	local run_status
-	local discovered
-	local session_before
-	local session_after
+	local plan_dir
 
 	if [[ "$DRY_RUN" -eq 1 || -n "$SANDBOX_NAME" ]]; then
 		return 0
@@ -321,43 +320,34 @@ bootstrap_root_session_with_plan() {
 		return 0
 	fi
 
-	session_before="$(latest_opencode_session_any || true)"
+	plan_dir="$(dirname "$BOOTSTRAP_PLAN_FILE")"
+	mkdir -p "$plan_dir"
+
 	scope_title="$(issue_title "$scope_id" 2>/dev/null || true)"
-	bootstrap_prompt="Examine Beads issue ${scope_id} (${scope_title}) in ${ROOT_DIR} and devise a concise execution plan. Planning only: do not modify files, do not commit, and do not close issues in this bootstrap run."
+	bootstrap_prompt="Examine Beads issue ${scope_id} (${scope_title}) in ${ROOT_DIR} and devise a concise execution plan. Write the plan as a markdown file to ${BOOTSTRAP_PLAN_FILE}. Planning only: do not modify source files, do not commit, and do not close issues in this bootstrap run."
 	bootstrap_steps="$BOOTSTRAP_PLAN_STEPS"
 	config_json="$(build_opencode_config_content "$bootstrap_steps")"
-	tmp_log="$(mktemp)"
 
-	log "Bootstrapping OpenCode session with plan agent for ${scope_id}"
+	log "Bootstrapping plan for ${scope_id} -> ${BOOTSTRAP_PLAN_FILE}"
 
 	set +e
-	(cd "$ROOT_DIR" && env OPENCODE_CONFIG_CONTENT="$config_json" opencode run --dir "$ROOT_DIR" --agent plan "$bootstrap_prompt") 2>&1 | tee "$tmp_log"
-	run_status=${PIPESTATUS[0]}
+	(cd "$ROOT_DIR" && env OPENCODE_CONFIG_CONTENT="$config_json" opencode run --dir "$ROOT_DIR" --agent plan "$bootstrap_prompt")
+	run_status=$?
 	set -e
 
-	discovered="$(session_id_from_log "$tmp_log" || true)"
-	session_after="$(latest_opencode_session_any || true)"
-
-	if ! valid_session_id "$discovered" || [[ "$discovered" == "$session_before" ]]; then
-		if valid_session_id "$session_after" && [[ "$session_after" != "$session_before" ]]; then
-			discovered="$session_after"
-		fi
-	fi
-
-	if valid_session_id "$discovered"; then
-		ROOT_SESSION_ID="$discovered"
-		SESSION_ESTABLISHED=1
-		log "Bootstrap session ready: ${ROOT_SESSION_ID}"
-		rm -f "$tmp_log"
-		return 0
-	fi
-
-	rm -f "$tmp_log"
 	if [[ "$run_status" -ne 0 ]]; then
-		log "WARNING: bootstrap plan run exited non-zero (${run_status}); no session discovered"
-	else
-		log "WARNING: bootstrap plan run completed but no session id was discovered"
+		log "WARNING: bootstrap plan run exited non-zero (${run_status})"
 	fi
+
+	if [[ -s "$BOOTSTRAP_PLAN_FILE" ]]; then
+		log "Plan written to ${BOOTSTRAP_PLAN_FILE}"
+	else
+		log "WARNING: bootstrap plan run completed but ${BOOTSTRAP_PLAN_FILE} was not written or is empty"
+	fi
+
+	# Intentionally do NOT set ROOT_SESSION_ID — the plan session is discarded
+	# so build runs start with a clean context window and only reference the
+	# plan via the written markdown file.
 }
 
 issue_title() {
@@ -393,6 +383,12 @@ build_prompt() {
 	local scope_id="$2"
 	local title="$3"
 
+	local plan_ref=""
+	if [[ -s "$BOOTSTRAP_PLAN_FILE" ]]; then
+		plan_ref="
+- A bootstrap plan is available at ${BOOTSTRAP_PLAN_FILE} — read it before starting work."
+	fi
+
 	cat <<EOF
 Work Beads issue ${issue_id} (${title}) in ${ROOT_DIR}.
 
@@ -402,7 +398,8 @@ Rules:
 - If ${issue_id} is a parent/epic and cannot be closed directly, do not stay stuck on the parent; identify and process actionable child tasks/branches needed to move the parent toward closure.
 - If work is complete and acceptance criteria are met, close the issue.
 - If blocked, leave a concise note explaining exactly what is blocked.
-- Do not do unrelated work.
+- Do not create a single PR for each sub task, try and keep it under a single PR for the whole epic/task as copilot reviews make merging complex. If you must create multiple, always use a stacked PR.
+- Do not do unrelated work.${plan_ref}
 EOF
 }
 
